@@ -1,0 +1,362 @@
+name: CI/CD Pipeline for Online Shop
+
+# Trigger the workflow on pushes to the 'github-action' branch.
+on:
+  push:
+    branches:
+      - github-action
+
+jobs:
+  ###########################################################################
+  # Job 1: Configure Terraform Backend
+  ###########################################################################
+  terraform-backend:
+    name: Configure Terraform Backend
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout the repository.
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      # Step 2: Setup Terraform CLI.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      # Step 3: Verify AWS CLI installation.
+      - name: Check AWS CLI Version
+        run: aws --version
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Step 4: Configure AWS Credentials.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      # Step 5: Test AWS Configuration by listing S3 buckets.
+      - name: Testing Configuration
+        run: aws s3 ls
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Step 6: SMART BACKEND DETECTION - Check if S3 Bucket exists for Terraform backend
+      # This prevents errors when trying to create resources that already exist
+      - name: Check if S3 Bucket Exists
+        id: check_bucket
+        run: |
+          echo "🔍 Checking if S3 bucket exists for Terraform backend..."
+          
+          # Try to list the S3 bucket contents
+          # 2>&1 redirects stderr (error messages) to stdout so we can capture them
+          # grep -q searches for 'NoSuchBucket' error message quietly (no output, just exit code)
+          if aws s3 ls "s3://${{ secrets.AWS_S3_BUCKET }}" 2>&1 | grep -q 'NoSuchBucket'; then
+            # BUCKET DOESN'T EXIST - Set CREATE_BACKEND=true
+            # This tells Terraform: "Please create the S3 bucket and DynamoDB table"
+            echo "CREATE_BACKEND=true" >> $GITHUB_ENV
+            echo "🔧 S3 bucket not found. Will create backend resources."
+          else
+            # BUCKET EXISTS - Set CREATE_BACKEND=false  
+            # This tells Terraform: "Skip creating backend resources, they already exist"
+            echo "CREATE_BACKEND=false" >> $GITHUB_ENV
+            echo "✅ S3 bucket found. Will use existing backend resources."
+          fi
+          
+          echo "🎯 CREATE_BACKEND variable will be passed to Terraform as var.create_backend"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Step 7: Initialize the Terraform backend.
+      - name: Initialize Backend
+        run: terraform init
+        working-directory: terraform/terraform_backend
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Step 8: Apply Terraform backend configuration with conditional logic
+      # The CREATE_BACKEND variable from Step 6 is automatically available here
+      # Terraform will use it in: count = var.create_backend ? 1 : 0
+      - name: Apply Backend Configuration
+        run: |
+          echo "🚀 Applying Terraform backend configuration..."
+          echo "📝 CREATE_BACKEND value: $CREATE_BACKEND"
+          echo "🎯 This will be passed to Terraform as var.create_backend"
+          terraform apply --auto-approve -var="create_backend=$CREATE_BACKEND"
+        working-directory: terraform/terraform_backend
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  ###########################################################################
+  # Job 2: Provision Infrastructure Resources
+  ###########################################################################
+  terraform-resources:
+    name: Provision Resources
+    runs-on: ubuntu-latest
+    needs: terraform-backend
+    outputs:
+      ec2_public_ip: ${{ steps.get-ec2-ip.outputs.ec2_ip }}
+    steps:
+      # Checkout the repository.
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      # Setup Terraform CLI.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      # Verify AWS CLI installation.
+      - name: Check AWS CLI Version
+        run: aws --version
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Configure AWS Credentials.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      # Initialize Terraform using the remote backend.
+      - name: Initialize Resources with Backend
+        run: terraform init
+        working-directory: terraform/terraform_resources
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Execute Terraform plan to review changes.
+      - name: Terraform Plan
+        run: terraform plan
+        working-directory: terraform/terraform_resources
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Apply the Terraform changes.
+      - name: Apply Terraform Changes
+        run: terraform apply --auto-approve
+        working-directory: terraform/terraform_resources
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Capture the EC2 instance's public IP from Terraform outputs.
+      - name: Get EC2 Public IP
+        id: get-ec2-ip
+        run: echo "ec2_ip=$(terraform output -raw instance_public_ip)" >> $GITHUB_OUTPUT
+        working-directory: terraform/terraform_resources
+
+  ###########################################################################
+  # Job 3: Build & Push Docker Image to DockerHub
+  ###########################################################################
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: terraform-resources
+    steps:
+      # Checkout the repository.
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      # Log in to DockerHub using credentials stored in GitHub Secrets.
+      - name: Log in to DockerHub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      # Build the Docker image for the online shop.
+      - name: Build Docker Image
+        run: docker build -t ${{ secrets.DOCKER_USERNAME }}/online_shop:latest .
+
+      # Push the built image to DockerHub.
+      - name: Push Docker Image to DockerHub
+        run: docker push ${{ secrets.DOCKER_USERNAME }}/online_shop:latest
+
+  ###########################################################################
+  # Job 4: Deploy the Application on EC2 Instance (Updated with SSH Action)
+  ###########################################################################
+  deploy:
+    name: Deploy on EC2
+    runs-on: ubuntu-latest
+    needs: [terraform-resources, docker]
+    steps:
+      # Checkout the repository.
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      # Step 1: Update the system on the EC2 instance via SSH Action
+      - name: Update System
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ needs.terraform-resources.outputs.ec2_public_ip }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            sudo apt update -y
+            echo "✅ System updated successfully"
+
+      # Step 2: Install Docker on the EC2 instance
+      - name: Install Docker
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ needs.terraform-resources.outputs.ec2_public_ip }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            # Install Docker if not already installed
+            if ! command -v docker &> /dev/null; then
+              echo "🔧 Installing Docker..."
+              sudo apt install docker.io -y
+              sudo usermod -aG docker ubuntu
+              echo "✅ Docker installed successfully"
+            else
+              echo "✅ Docker already installed"
+            fi
+
+      # Step 3: Deploy the Docker container on the EC2 instance
+      - name: Deploy Container
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ needs.terraform-resources.outputs.ec2_public_ip }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            echo "🚀 Starting application deployment..."
+            
+            # Stop and remove existing container if it exists
+            sudo docker stop online_shop || true
+            sudo docker rm online_shop || true
+            
+            # Pull the latest image
+            echo "📥 Pulling latest Docker image..."
+            sudo docker pull ${{ secrets.DOCKER_USERNAME }}/online_shop:latest
+            
+            # Run the new container
+            echo "🏃 Starting new container..."
+            sudo docker run -d -p 3000:3000 --name online_shop ${{ secrets.DOCKER_USERNAME }}/online_shop:latest
+            
+            # Verify deployment
+            sleep 5
+            if sudo docker ps | grep -q online_shop; then
+              echo "✅ Application deployed successfully!"
+              echo "🌐 Application is running on http://$(curl -s ifconfig.me):3000"
+            else
+              echo "❌ Deployment failed!"
+              exit 1
+            fi
+
+  ###########################################################################
+  # Job 5: Send Notification Email (NEW)
+  ###########################################################################
+  notify:
+    name: Send Notification Email
+    runs-on: ubuntu-latest
+    needs: [terraform-backend, terraform-resources, docker, deploy]
+    if: always()  # Ensure this job runs regardless of previous outcomes
+    steps:
+      # Step to determine overall pipeline status
+      - name: Determine overall pipeline status
+        id: pipeline-status
+        run: |
+          # Check if all required jobs succeeded
+          if [[ "${{ needs.terraform-backend.result }}" == "success" ]] \
+          && [[ "${{ needs.terraform-resources.result }}" == "success" ]] \
+          && [[ "${{ needs.docker.result }}" == "success" ]] \
+          && [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "result=Success ✅" >> $GITHUB_OUTPUT
+          else
+            echo "result=Failed ❌" >> $GITHUB_OUTPUT
+          fi
+
+      # Step to send notification email
+      - name: Send Email
+        uses: hilarion5/send-mail@v1
+        with:
+          smtp-server: smtp.gmail.com
+          smtp-port: 465
+          smtp-secure: true
+          from-email: ${{ secrets.MAIL_FROM }}
+          to-email: amitabhdevops2024@gmail.com # Add multiple email addresses separated by commas
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "CI/CD Pipeline Notification: ${{ github.workflow }} - ${{ steps.pipeline-status.outputs.result }}"
+          body: ""
+          html: |
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background-color: #ffffff;">
+              <h2 style="color: #24292e; text-align: center;">🚀 CI/CD Pipeline Notification</h2>
+      
+              <div style="background-color: #f6f8fa; padding: 16px; border-radius: 6px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                  <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;"><strong>Workflow</strong></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;">${{ github.workflow }}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;"><strong>Triggered by</strong></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;">${{ github.actor }}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;"><strong>Repository</strong></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;">${{ github.repository }}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;"><strong>Run Details</strong></td>
+                    <td style="padding: 10px; border-bottom: 1px solid #ddd;">
+                      <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" style="color: #0366d6; text-decoration: none;">View Run #${{ github.run_id }}</a>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+      
+              <h3 style="margin-top: 16px;">🛠 Job Statuses</h3>
+              <table style="width: 100%; border-collapse: collapse; background-color: #fff;">
+                <tr style="background-color: #f6f8fa;">
+                  <th style="padding: 10px; text-align: left;">Job</th>
+                  <th style="padding: 10px; text-align: center;">Status</th>
+                </tr>
+                <tr>
+                  <td style="padding: 10px;">Terraform Backend</td>
+                  <td style="padding: 10px; text-align: center; color: white; background-color: 
+                    ${{ (needs.terraform-backend.result == 'success' && '#28a745') || '#d73a49' }}; border-radius: 4px;">
+                    ${{ needs.terraform-backend.result }}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px;">Terraform Resources</td>
+                  <td style="padding: 10px; text-align: center; color: white; background-color: 
+                    ${{ (needs.terraform-resources.result == 'success' && '#28a745') || '#d73a49' }}; border-radius: 4px;">
+                    ${{ needs.terraform-resources.result }}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px;">Docker Build</td>
+                  <td style="padding: 10px; text-align: center; color: white; background-color: 
+                    ${{ (needs.docker.result == 'success' && '#28a745') || '#d73a49' }}; border-radius: 4px;">
+                    ${{ needs.docker.result }}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px;">Deployment</td>
+                  <td style="padding: 10px; text-align: center; color: white; background-color: 
+                    ${{ (needs.deploy.result == 'success' && '#28a745') || '#d73a49' }}; border-radius: 4px;">
+                    ${{ needs.deploy.result }}
+                  </td>
+                </tr>
+              </table>
+      
+              <p style="color: #6a737d; font-size: 0.9em; margin-top: 20px; text-align: center;">
+                This email was sent automatically by <strong>GitHub Actions</strong>.
+              </p>
+            </div>
