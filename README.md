@@ -1,10 +1,4 @@
 # Online Shop 🛍️
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![GitHub Profile](https://img.shields.io/badge/GitHub-iemafzalhassan-blue?logo=github&style=flat)](https://github.com/iemafzalhassan)
-![Forks](https://img.shields.io/github/forks/iemafzalhassan/online_shop)
-[![Stars](https://img.shields.io/github/stars/iemafzalhassan/online_shop)](https://github.com/iemafzalhassan/online_shop)
-![GitHub last commit](https://img.shields.io/github/last-commit/iemafzalhassan/easyshop?color=red)
-<p align="center">
 
 
 A modern, responsive e-commerce platform built with React, featuring a sophisticated dark/light theme system and advanced product management.
@@ -40,7 +34,7 @@ A modern, responsive e-commerce platform built with React, featuring a sophistic
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/iemafzalhassan/online-shop.git
+git clone https://github.com/Mairazul-Khan/online_shop.git
 cd online-shop
 ```
 
